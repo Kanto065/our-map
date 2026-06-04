@@ -6,3 +6,8 @@ dist-ssr
 .vite
 *.log
 npm-debug.log*
+
+# Local environment config (Supabase / Jamendo keys)
+.env
+.env.local
+.env.*.local

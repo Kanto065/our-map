@@ -1,8 +1,10 @@
 import { useRef, useState } from 'react'
 import { MapContainer, TileLayer, Marker, useMapEvents } from 'react-leaflet'
 import L from 'leaflet'
-import { useExif, fileToDataURL } from '../hooks/useExif.js'
+import { useExif } from '../hooks/useExif.js'
 import { groupByProximity } from '../utils/cluster.js'
+import { uploadPhotos, isStorageConfigured } from '../utils/storage.js'
+import SongPicker from './SongPicker.jsx'
 import { MOOD_LIST, GROUP_RADIUS_METERS } from '../constants.js'
 
 const heartIcon = L.divIcon({
@@ -48,10 +50,12 @@ export default function AddMemoryModal({ onClose, onSave }) {
 
   const [step, setStep] = useState(1)
   const [busy, setBusy] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState(null)
   const [closing, setClosing] = useState(false)
 
-  // Photo processing results.
-  const [photos, setPhotos] = useState([]) // [{ dataUrl, coords|null }]
+  // Photos: keep the File (for upload) + an object-URL preview + coords.
+  const [photos, setPhotos] = useState([]) // [{ file, previewUrl, coords|null }]
   const [groups, setGroups] = useState([]) // proximity groups of located photos
   const [manualCoords, setManualCoords] = useState(null) // fallback placement
 
@@ -59,15 +63,15 @@ export default function AddMemoryModal({ onClose, onSave }) {
   const [caption, setCaption] = useState('')
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10))
   const [mood, setMood] = useState('romantic')
-  const [audio, setAudio] = useState(null) // { dataUrl, name }
+  const [song, setSong] = useState(null) // { id, name, artist, audioUrl, image }
 
   const fileInputRef = useRef(null)
-  const audioInputRef = useRef(null)
 
   const hasGps = groups.length > 0
   const ungroupedCount = photos.filter((p) => !p.coords).length
 
   function requestClose() {
+    photos.forEach((p) => p.previewUrl && URL.revokeObjectURL(p.previewUrl))
     setClosing(true)
     setTimeout(onClose, 280)
   }
@@ -78,28 +82,23 @@ export default function AddMemoryModal({ onClose, onSave }) {
     if (!files.length) return
     setBusy(true)
     try {
-      // Process each file into { dataUrl, coords, date }, keeping the photo
-      // ↔ coordinate pairing intact.
+      // Extract GPS + date per file while keeping the File for later upload.
       const paired = await Promise.all(
         files.map(async (file) => {
-          const [dataUrl, coords, exifDate] = await Promise.all([
-            fileToDataURL(file),
-            extractGPS(file),
-            extractDate(file),
-          ])
-          return { dataUrl, coords, exifDate }
+          const [coords, exifDate] = await Promise.all([extractGPS(file), extractDate(file)])
+          return { file, previewUrl: URL.createObjectURL(file), coords, exifDate }
         })
       )
 
       const grouped = groupByProximity(
-        paired.filter((p) => p.coords).map((p) => ({ coords: p.coords, dataUrl: p.dataUrl })),
+        paired.filter((p) => p.coords).map((p) => ({ coords: p.coords, file: p.file })),
         GROUP_RADIUS_METERS
       )
 
       const firstDate = paired.find((p) => p.exifDate)?.exifDate
       if (firstDate) setDate(firstDate)
 
-      setPhotos(paired.map((p) => ({ dataUrl: p.dataUrl, coords: p.coords })))
+      setPhotos(paired.map((p) => ({ file: p.file, previewUrl: p.previewUrl, coords: p.coords })))
       setGroups(grouped)
       setStep(2)
     } finally {
@@ -107,62 +106,53 @@ export default function AddMemoryModal({ onClose, onSave }) {
     }
   }
 
-  async function handleAudio(e) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const dataUrl = await fileToDataURL(file)
-    setAudio({ dataUrl, name: file.name })
-  }
-
   function canSave() {
     if (!photos.length) return false
     return hasGps || !!manualCoords
   }
 
-  function handleSave() {
-    if (!canSave()) return
+  async function handleSave() {
+    if (!canSave() || saving) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      // Determine the file set for each memory (one per proximity group).
+      const specs = []
+      if (hasGps) {
+        groups.forEach((group, idx) => {
+          const files = group.items.map((i) => i.file)
+          // Photos with no GPS ride along with the first group.
+          if (idx === 0) files.push(...photos.filter((p) => !p.coords).map((p) => p.file))
+          specs.push({ coords: group.coords, files })
+        })
+      } else {
+        specs.push({ coords: manualCoords, files: photos.map((p) => p.file) })
+      }
 
-    const drafts = []
-
-    if (hasGps) {
-      // One memory per proximity group. Photos with no GPS ride along with the
-      // first group so they aren't lost.
-      groups.forEach((group, idx) => {
-        const groupPhotos = group.items.map((i) => i.dataUrl)
-        if (idx === 0) {
-          groupPhotos.push(...photos.filter((p) => !p.coords).map((p) => p.dataUrl))
-        }
-        drafts.push({
-          coords: group.coords,
-          photos: groupPhotos,
+      // Upload photos (Supabase, or base64 fallback) and assemble drafts.
+      const drafts = await Promise.all(
+        specs.map(async (spec) => ({
+          coords: spec.coords,
+          photos: await uploadPhotos(spec.files),
           caption,
           date,
           mood,
-          audioFile: audio?.dataUrl || null,
-        })
-      })
-    } else {
-      // No EXIF anywhere — single location placed manually on the map.
-      drafts.push({
-        coords: manualCoords,
-        photos: photos.map((p) => p.dataUrl),
-        caption,
-        date,
-        mood,
-        audioFile: audio?.dataUrl || null,
-      })
-    }
+          song: song || null,
+        }))
+      )
 
-    onSave(drafts)
-    requestClose()
+      onSave(drafts)
+      requestClose()
+    } catch (err) {
+      console.error(err)
+      setSaveError('Something went wrong saving. Please try again.')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
-    <div
-      className={`fixed inset-0 z-[1000] flex items-end justify-center sm:items-center ${
-        closing ? 'animate-fade-in' : 'animate-fade-in'
-      }`}
-    >
+    <div className="fixed inset-0 z-[1000] flex items-end justify-center animate-fade-in sm:items-center">
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={requestClose} />
 
@@ -174,7 +164,7 @@ export default function AddMemoryModal({ onClose, onSave }) {
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 pb-3 pt-4">
-          <div className="h-1.5 w-10 -translate-x-1/2 rounded-full bg-white/20 absolute left-1/2 top-2" />
+          <div className="absolute left-1/2 top-2 h-1.5 w-10 -translate-x-1/2 rounded-full bg-white/20" />
           <h2 className="text-lg font-semibold tracking-tight">
             {step === 1 && 'Add a memory'}
             {step === 2 && 'Where was it?'}
@@ -237,7 +227,7 @@ export default function AddMemoryModal({ onClose, onSave }) {
                 {photos.map((p, i) => (
                   <img
                     key={i}
-                    src={p.dataUrl}
+                    src={p.previewUrl}
                     alt=""
                     className="h-16 w-16 flex-shrink-0 rounded-xl object-cover ring-1 ring-white/10"
                   />
@@ -345,35 +335,30 @@ export default function AddMemoryModal({ onClose, onSave }) {
                 <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-white/50">
                   Background song (optional)
                 </label>
-                <input
-                  ref={audioInputRef}
-                  type="file"
-                  accept="audio/*"
-                  className="hidden"
-                  onChange={handleAudio}
-                />
-                <button
-                  onClick={() => audioInputRef.current?.click()}
-                  className="flex w-full items-center gap-3 rounded-2xl border border-navy-600 bg-navy-800/60 px-4 py-3 text-sm text-white/80 transition active:scale-95"
-                >
-                  <span className="text-lg">🎵</span>
-                  <span className="truncate">{audio ? audio.name : 'Add an mp3 to set the mood'}</span>
-                </button>
+                <SongPicker value={song} onChange={setSong} />
               </div>
+
+              {!isStorageConfigured() && (
+                <p className="text-xs text-white/40">
+                  Photos will be stored locally until Supabase is configured (see .env.example).
+                </p>
+              )}
+              {saveError && <p className="text-xs text-red-300">{saveError}</p>}
 
               <div className="flex gap-3 pt-1">
                 <button
                   onClick={() => setStep(2)}
-                  className="flex-1 rounded-full border border-white/15 py-3 font-medium text-white/80 transition active:scale-95"
+                  disabled={saving}
+                  className="flex-1 rounded-full border border-white/15 py-3 font-medium text-white/80 transition active:scale-95 disabled:opacity-50"
                 >
                   Back
                 </button>
                 <button
-                  disabled={!canSave()}
+                  disabled={!canSave() || saving}
                   onClick={handleSave}
                   className="flex-1 rounded-full bg-rose-glow py-3 font-semibold text-navy-900 shadow-lg shadow-rose-glow/30 transition active:scale-95 disabled:opacity-50"
                 >
-                  Save memory
+                  {saving ? 'Saving…' : 'Save memory'}
                 </button>
               </div>
             </div>

@@ -32,7 +32,8 @@ function makeId() {
  * Central store for travel memories, persisted to localStorage.
  *
  * Memory shape:
- * { id, coords:{lat,lng}, photos:[base64], caption, date, mood, audioFile:base64|null, createdAt }
+ * { id, coords:{lat,lng}, photos:[url], caption, date, mood,
+ *   song:{ id, name, artist, audioUrl, image }|null, createdAt }
  */
 export function useMemories() {
   const [memories, setMemories] = useState(loadMemories)
@@ -66,7 +67,7 @@ export function useMemories() {
       caption: memory.caption || '',
       date: memory.date || new Date().toISOString().slice(0, 10),
       mood: memory.mood || 'happy',
-      audioFile: memory.audioFile || null,
+      song: memory.song || null,
     }
     setMemories((prev) => [...prev, record])
     return record

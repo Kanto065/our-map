@@ -38,10 +38,15 @@ export default function StoryViewer({ memory, onClose }) {
   }, [memory])
 
   // ---- Background song (plays on open, stops on close) ----
+  // Supports the Jamendo song picker (memory.song.audioUrl) and legacy
+  // uploaded audio (memory.audioFile).
+  const audioSrc = memory.song?.audioUrl || memory.audioFile || null
+
   useEffect(() => {
-    if (!memory.audioFile) return
+    if (!audioSrc) return
     const howl = new Howl({
-      src: [memory.audioFile],
+      src: [audioSrc],
+      format: ['mp3'], // Jamendo stream URLs have no file extension
       html5: true,
       loop: true,
       volume: 0.85,
@@ -262,7 +267,11 @@ export default function StoryViewer({ memory, onClose }) {
               {index + 1} / {photos.length}
             </span>
           )}
-          {memory.audioFile && <span>🎵 playing</span>}
+          {memory.song ? (
+            <span className="truncate">🎵 {memory.song.name} · {memory.song.artist}</span>
+          ) : (
+            memory.audioFile && <span>🎵 playing</span>
+          )}
         </div>
         <p className="mt-3 text-center text-[11px] text-white/40">
           Tap to advance · hold to pause · swipe down to close
